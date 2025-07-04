@@ -114,6 +114,9 @@ class RemoteBackend(StorageBackendInterface):
                 self.local_cpu_backend,
                 self.config,
             )
+            # Set metadata for the connector if it supports it
+            if hasattr(self.connection, "set_engine_metadata"):
+                self.connection.set_engine_metadata(self.metadata)
             logger.info(
                 f"Connection initialized/re-established at {self.config.remote_url}"
             )

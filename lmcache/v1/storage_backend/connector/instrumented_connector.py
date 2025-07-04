@@ -79,3 +79,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     def getWrappedConnector(self) -> RemoteConnector:
         return self._connector
+
+    def __getattr__(self, name):
+        """Delegate any missing methods to the underlying connector."""
+        return getattr(self._connector, name)

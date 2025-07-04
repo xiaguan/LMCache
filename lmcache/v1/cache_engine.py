@@ -376,6 +376,7 @@ class LMCacheEngine:
             num_required_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_retrieve_request(num_required_tokens)
 
+        start_time = time.perf_counter()
         ret_mask = torch.zeros_like(tokens, dtype=torch.bool, device="cpu")
 
         key_mapping: Dict[str, List[CacheEngineKey]] = {}
@@ -441,13 +442,22 @@ class LMCacheEngine:
             reordered_keys.extend(keys)
             reordered_starts.extend(start_mapping[location])
             reordered_ends.extend(end_mapping[location])
+        logger.info(
+            "Load from storage backends takes %.4f ms",
+            (time.perf_counter() - start_time) * 1000,
+        )
 
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
+        gpu_start_time = time.perf_counter()
         self.gpu_connector.batched_to_gpu(
             reordered_memory_objs, reordered_starts, reordered_ends, **kwargs
+        )
+        logger.info(
+            "Transfer to GPU takes %.4f ms",
+            (time.perf_counter() - gpu_start_time) * 1000,
         )
 
         # TODO(Jiayi): Remove the following for loop with batched operations
