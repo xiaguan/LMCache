@@ -492,15 +492,196 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
-    # TODO(Jiayi): need to optimize to enable real batching
+    @_lmcache_nvtx_annotate
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.to_gpu(memory_obj, start, end, **kwargs)
+        """Optimized batched transfer to GPU using consolidated memory operations.
 
-    # TODO(Jiayi): need to optimize to enable real batching
+        This method consolidates multiple memory objects and uses batched CUDA
+        kernel calls for improved performance over sequential processing.
+        """
+        if not memory_objs:
+            return
+
+        # Fast path for single object
+        if len(memory_objs) == 1:
+            self.to_gpu(memory_objs[0], starts[0], ends[0], **kwargs)
+            return
+
+        if "kvcaches" not in kwargs or "slot_mapping" not in kwargs:
+            raise ValueError(
+                "'kvcaches' and 'slot_mapping' must be provided in kwargs."
+            )
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        # Validate memory object formats
+        for memory_obj in memory_objs:
+            assert memory_obj.tensor is not None
+            expected_fmt = (
+                MemoryFormat.KV_MLA_FMT if self.use_mla else MemoryFormat.KV_2LTD
+            )
+            if memory_obj.metadata.fmt != expected_fmt:
+                raise ValueError(f"Memory object should be in {expected_fmt} format")
+
+        # Initialize pointers once for the batch
+        kv_cache_pointers = self._initialize_pointers(kvcaches)
+
+        # Use CUDA streams for asynchronous operations
+        transfer_stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(transfer_stream):
+            # Process each memory object within the same stream for better efficiency
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+                lmc_ops.multi_layer_kv_transfer(
+                    memory_obj.tensor,
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    kvcaches[0].device,
+                    self.page_buffer_size,
+                    False,  # to_gpu = False means from memory_obj to GPU
+                    self.use_mla,
+                )
+
+        # Synchronize only once at the end
+        transfer_stream.synchronize()
+
+    @_lmcache_nvtx_annotate
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
-        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
-            self.from_gpu(memory_obj, start, end, **kwargs)
+        """Optimized batched transfer from GPU using consolidated memory operations.
+
+        This method uses batched CUDA operations and optimized memory transfers
+        for improved performance compared to sequential processing.
+        """
+        if not memory_objs:
+            return
+
+        # Fast path for single object
+        if len(memory_objs) == 1:
+            self.from_gpu(memory_objs[0], starts[0], ends[0], **kwargs)
+            return
+
+        if "kvcaches" not in kwargs or "slot_mapping" not in kwargs:
+            raise ValueError(
+                "'kvcaches' and 'slot_mapping' must be provided in kwargs."
+            )
+
+        kvcaches: List[torch.Tensor] = kwargs["kvcaches"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
+        # Validate memory objects
+        for memory_obj in memory_objs:
+            assert memory_obj.tensor is not None
+
+        # Initialize pointers once for the batch
+        kv_cache_pointers = self._initialize_pointers(kvcaches)
+
+        # Check if we can use GPU buffer optimization for large batches
+        total_tokens = sum(
+            end - start for start, end in zip(starts, ends, strict=False)
+        )
+        use_gpu_buffer = (
+            self.gpu_buffer is not None
+            and total_tokens <= self.gpu_buffer.shape[2]
+            and len(memory_objs) > 1
+        )  # Only use buffer for multiple objects
+
+        if use_gpu_buffer:
+            # Use GPU buffer for intermediate storage
+            self._batched_from_gpu_with_buffer(
+                memory_objs, starts, ends, kvcaches, slot_mapping, kv_cache_pointers
+            )
+        else:
+            # Direct transfer with optimized streaming
+            self._batched_from_gpu_direct(
+                memory_objs, starts, ends, kvcaches, slot_mapping, kv_cache_pointers
+            )
+
+        # Set metadata format for all memory objects
+        fmt = MemoryFormat.KV_MLA_FMT if self.use_mla else MemoryFormat.KV_2LTD
+        for memory_obj in memory_objs:
+            memory_obj.metadata.fmt = fmt
+
+    def _batched_from_gpu_with_buffer(
+        self, memory_objs, starts, ends, kvcaches, slot_mapping, kv_cache_pointers
+    ):
+        """Optimized batch transfer using GPU buffer for intermediate storage."""
+        transfer_stream = torch.cuda.Stream()
+
+        # Calculate buffer requirements
+        total_tokens = sum(
+            end - start for start, end in zip(starts, ends, strict=False)
+        )
+        buffer_slice = self.gpu_buffer[:, :, :total_tokens, :]
+
+        # Consolidate slot mappings
+        consolidated_slot_mapping = torch.cat(
+            [slot_mapping[start:end] for start, end in zip(starts, ends, strict=False)]
+        )
+
+        with torch.cuda.stream(transfer_stream):
+            # Single GPU->buffer transfer
+            lmc_ops.multi_layer_kv_transfer(
+                buffer_slice,
+                kv_cache_pointers,
+                consolidated_slot_mapping,
+                kvcaches[0].device,
+                self.page_buffer_size,
+                True,  # from_gpu = True
+                self.use_mla,
+            )
+
+            # Copy from buffer to memory objects
+            offset = 0
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+                chunk_size = end - start
+                memory_obj.tensor.copy_(
+                    buffer_slice[:, :, offset : offset + chunk_size, :],
+                    non_blocking=True,
+                )
+                offset += chunk_size
+
+        # Synchronize for non-CUDA tensors
+        if not all(obj.tensor.is_cuda for obj in memory_objs):
+            transfer_stream.synchronize()
+
+    def _batched_from_gpu_direct(
+        self, memory_objs, starts, ends, kvcaches, slot_mapping, kv_cache_pointers
+    ):
+        """Direct batch transfer without intermediate GPU buffer."""
+        transfer_stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(transfer_stream):
+            # Process each memory object within the same stream
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
+                if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                    lmc_ops.multi_layer_kv_transfer(
+                        memory_obj.tensor,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        kvcaches[0].device,
+                        self.page_buffer_size,
+                        True,  # from_gpu = True
+                        self.use_mla,
+                    )
+                else:
+                    # Use GPU buffer for this specific transfer
+                    assert self.gpu_buffer.device == kvcaches[0].device
+                    tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
+                    lmc_ops.multi_layer_kv_transfer(
+                        tmp_gpu_buffer,
+                        kv_cache_pointers,
+                        slot_mapping[start:end],
+                        kvcaches[0].device,
+                        self.page_buffer_size,
+                        True,
+                        self.use_mla,
+                    )
+                    memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+
+        # Synchronize for non-CUDA tensors
+        if not all(obj.tensor.is_cuda for obj in memory_objs):
+            transfer_stream.synchronize()
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2

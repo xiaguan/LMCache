@@ -252,4 +252,4 @@ def CreateConnector(
     manager = ConnectorManager(url, loop, local_cpu_backend, config)
     connector = manager.create_connector()
 
-    return InstrumentedRemoteConnector(connector)
+    return connector

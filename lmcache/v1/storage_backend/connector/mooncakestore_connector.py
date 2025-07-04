@@ -347,7 +347,7 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             return None
 
-    async def batch_get(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
+    def batch_get(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
         if self.metadata_context is None:
             logger.error("Metadata context not set. Cannot retrieve data.")
             return [None] * len(keys)
@@ -468,7 +468,7 @@ class MooncakestoreConnector(RemoteConnector):
         except Exception as e:
             logger.error(f"Failed to put key {key_str},data: {type(memory_obj)}: {e}")
 
-    async def batch_put(self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]):
+    def batch_put(self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]):
         key_strs = [key.to_string() for key in keys]
         buffer_ptrs = []
         buffer_sizes = []
@@ -490,14 +490,10 @@ class MooncakestoreConnector(RemoteConnector):
         valid_key_strs = [key_strs[i] for i in valid_indices]
 
         try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.batch_put_from,
-                    valid_key_strs,
-                    buffer_ptrs,
-                    buffer_sizes,
-                ),
-                timeout=self.config.transfer_timeout,
+            results = self.store.batch_put_from(
+                valid_key_strs,
+                buffer_ptrs,
+                buffer_sizes,
             )
 
             for i, result in zip(valid_indices, results, strict=False):

@@ -221,6 +221,25 @@ class StorageManager:
 
         return None
 
+    def get_batch(self, keys: List[CacheEngineKey]) -> List[Optional[MemoryObj]]:
+        """
+        Blocking function to get multiple memory objects from the storages.
+        This is the public interface for batch get operations that can be called
+        from cache engines. Uses intelligent batching when beneficial.
+
+        :param List[CacheEngineKey] keys: The keys of the MemoryObjs to retrieve.
+        :return: List of memory objects, with None for keys that don't exist.
+        """
+        if not keys:
+            return []
+
+        # For single key, use the regular get method to maintain existing behavior
+        if len(keys) == 1:
+            return [self.get(keys[0])]
+
+        # For multiple keys, use the batch implementation
+        return self.batched_get_blocking(keys)
+
     def get_non_blocking(self, key: CacheEngineKey) -> Optional[Future]:
         """
         Non-blocking function to get the memory object from the storages.
@@ -247,6 +266,29 @@ class StorageManager:
         storage_backend = self.storage_backends[storage_backend_name]
         memory_objs = storage_backend.batched_get_blocking(keys)
         return memory_objs
+
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """
+        Blocking function to get multiple memory objects from the storage.
+        Assumes single backend and batch operations are always most efficient.
+
+        :param List[CacheEngineKey] keys: The keys of the MemoryObjs to retrieve.
+        :return: List of memory objects, with None for keys that don't exist.
+        """
+        if not keys:
+            return []
+
+        # Get the first (and only) backend
+        backend = next(iter(self.storage_backends.values()))
+
+        # pirnt the backend name
+        logger.info(f"Using backend {backend}")
+
+        # Use batch operation directly
+        return backend.batched_get_blocking(keys)
 
     def layerwise_batched_get(
         self,

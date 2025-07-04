@@ -271,6 +271,64 @@ class RemoteBackend(StorageBackendInterface):
     ) -> Optional[Future]:
         raise NotImplementedError
 
+    @_lmcache_nvtx_annotate
+    @_init_connection_wrapper
+    def batched_get_blocking(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> List[Optional[MemoryObj]]:
+        """
+        Blocking batch get function that uses connector's batch_get when available,
+        falls back to individual get_blocking calls otherwise.
+        """
+        if self.connection is None:
+            logger.warning(
+                "Connection is None in batched_get_blocking, returning None list"
+            )
+            return [None] * len(keys)
+
+        # Check if connector supports batch operations
+        if not hasattr(self.connection, "batch_get"):
+            logger.debug(
+                "Connector does not support batch_get, falling back to individual gets"
+            )
+            # Use the default implementation from abstract backend
+            return super().batched_get_blocking(keys)
+
+        # Apply MLA worker id transformation if needed
+        processed_keys = []
+        for key in keys:
+            if self._mla_worker_id_as0_mode:
+                processed_key = CacheEngineKey(
+                    key.fmt, key.model_name, key.world_size, 0, key.chunk_hash
+                )
+                processed_keys.append(processed_key)
+            else:
+                processed_keys.append(key)
+
+        t1 = time.perf_counter()
+        memory_objs = self.connection.batch_get(processed_keys)
+
+        t2 = time.perf_counter()
+        self.stats_monitor.update_interval_remote_time_to_get_sync((t2 - t1) * 1000)
+
+        # Process results: deserialize non-None memory objects
+        results = []
+        for memory_obj in memory_objs:
+            if memory_obj is None:
+                results.append(None)
+            else:
+                decompressed_memory_obj = self.deserializer.deserialize(memory_obj)
+                results.append(decompressed_memory_obj)
+
+        t3 = time.perf_counter()
+        logger.info(
+            f"Batch get takes {(t2 - t1) * 1000:.6f} msec, "
+            f"batch deserialization takes {(t3 - t2) * 1000:.6f} msec, "
+            f"processed {len(keys)} keys"
+        )
+        return results
+
     def pin(self, key: CacheEngineKey) -> bool:
         logger.debug(
             "Remote backend does not support pin. "
