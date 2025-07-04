@@ -394,18 +394,7 @@ class LMCacheConnectorV1Impl:
         config = lmcache_get_config()
         self.layerwise_retrievers = []
         if role == KVConnectorRole.SCHEDULER:
-            # Check if mooncake_lookup_client is configured
-            if config.mooncake_lookup_client is not None:
-                # First Party
-                from lmcache.v1.lookup_client.mooncake_lookup_client import (
-                    MooncakeLookupClient,
-                )
-
-                self.lookup_client = MooncakeLookupClient(
-                    role, is_tp, vllm_config, config.mooncake_lookup_client
-                )
-            else:
-                self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
+            self.lookup_client = LMCacheLookupClient(role, is_tp, vllm_config)
         else:
             self.lmcache_engine = init_lmcache_engine(
                 vllm_config.model_config,
@@ -427,10 +416,7 @@ class LMCacheConnectorV1Impl:
             # NOTE: Only create the KV lookup API server on worker rank 0
             # when there are multiple workers
             assert self.lmcache_engine is not None
-            if (
-                vllm_config.parallel_config.rank == 0
-                and config.mooncake_lookup_client is None
-            ):
+            if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = LMCacheLookupServer(
                     self.lmcache_engine, role, is_tp, vllm_config
                 )
@@ -819,9 +805,8 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
-        if self.kv_role == "kv_producer" and not hasattr(
-            self.lookup_client, "supports_producer_reuse"
-        ):
+
+        if self.kv_role == "kv_producer":
             return 0
 
         token_ids = torch.tensor(request.prompt_token_ids)
@@ -856,6 +841,7 @@ class LMCacheConnectorV1Impl:
             num_external_hit_tokens,
             need_to_allocate,
         )
+
         if need_to_allocate <= 0:
             return 0
 
@@ -868,7 +854,6 @@ class LMCacheConnectorV1Impl:
         # TODO: Align to vLLM block size. Should test whether it can be removed
         # need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
-
         return need_to_allocate
 
     @_lmcache_nvtx_annotate
@@ -957,13 +942,9 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(cached_reqs.req_ids):
-            request_tracker = self._request_trackers[req_id]
-            new_token_ids = cached_reqs.new_token_ids[i]
-            new_block_ids = cached_reqs.new_block_ids[i]
-
-            request_tracker.update(new_token_ids, new_block_ids)
+        for request in scheduler_output.scheduled_cached_reqs:
+            request_tracker = self._request_trackers[request.req_id]
+            request_tracker.update(request.new_token_ids, request.new_block_ids)
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
