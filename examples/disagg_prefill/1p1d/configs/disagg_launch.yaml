@@ -1,0 +1,36 @@
+# User-editable launch parameters for the 1p1d disaggregated prefill example.
+# All fields are optional; sensible defaults mirror the original shell scripts.
+
+service_name: deepseek-r1-disagg
+
+model:
+  name: /root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  served_name: deepseek-r1-disagg
+  tensor_parallel_size: 1
+  max_model_len: 104752
+
+proxy:
+  host: localhost        # HTTP host for the FastAPI proxy
+  port: 9100             # HTTP port for the FastAPI proxy
+  zmq_host: localhost    # ZMQ bind host for prefiller notifications
+  zmq_port: 7500         # ZMQ port shared by all prefiller senders
+
+runtime:
+  log_dir: logs          # Log files will be created in this directory (relative to CWD)
+
+prefillers:
+  count: 1
+  host: localhost        # Base HTTP host for prefiller instances
+  http_port_start: 7100  # Starting HTTP port (incremented per instance)
+  devices: [4]           # CUDA device id per prefiller instance
+  kv_rpc_prefix: producer
+
+decoders:
+  count: 1
+  host: localhost
+  http_port_start: 7200
+  init_port_start: 7300
+  alloc_port_start: 7400
+  devices: [5]
+  kv_rpc_prefix: consumer
+  skip_last_n_tokens: 1

@@ -24,10 +24,31 @@ LMCache config files if needed.
 
 Run
 ```bash
-bash disagg_example_1p1d.sh
+python disagg_example_1p1d.py
 ```
 
-to start disaggregated prefill and benchmark the performance.
+to start disaggregated prefill and benchmark the performance. The Python launcher
+is the recommended entry point because it automatically shortens LMCache RPC
+socket names (avoiding ZeroMQ's 107-character IPC path limit), manages cleanup,
+and exposes additional conveniences such as `--dry-run` for inspecting the
+derived configuration without launching any processes. The legacy
+`disagg_example_1p1d.sh` script is still available for backward compatibility.
+
+The launcher reads runtime parameters from `configs/disagg_launch.yaml`. You can
+edit that file (or pass an alternate path via `--config`) to change the model
+name, served model alias, tensor parallel size, number of prefiller/decoder
+workers, GPU bindings, and proxy/ZMQ ports without touching the shell scripts.
+Logs are written to the `runtime.log_dir` directory specified in the YAML (the
+default is `logs/`). Prefiller/decoder LMCache RPC IDs now follow the same
+`producer{N}` / `consumer{N}` pattern as the legacy scripts, ensuring
+ZeroMQ IPC paths stay well within the 107-character limit. Once all services are
+up the launcher also prints a ready-to-run `vllm bench serve` command so you can
+quickly sanity check throughput; the command uses the served model alias (for
+example `deepseek-r1-disagg`) which is now also registered on the vLLM side
+alongside the physical model path so either value works when issuing requests.
+For tooling like `vllm bench serve` that resolves tokenizers via the file
+system, keep `--model` pointing at the actual directory (e.g.
+`/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B`).
 
 The script will:
 
@@ -89,7 +110,9 @@ P99 ITL (ms):                            11.43
 - `configs/lmcache-decoder-config.yaml` - Configuration for decoder server. The decoder lazily
   pulls KV chunks from Mooncake when the proxy notifies that uploads are complete.
   The Mooncake PD path no longer requires any `pd_peer_*` ZMQ endpoints; only the prefiller's
-  `pd_proxy_host`/`pd_proxy_port` pair is used to push completion notifications.
+  `pd_proxy_host`/`pd_proxy_port` pair is used to push completion notifications. When
+  using the Python launcher, the generated LMCache RPC IDs are truncated to keep
+  ZeroMQ IPC paths well under the maximum length.
   If you need to revert to the GPU→GPU direct transfer channel, change `transfer_channel` and
   related PD knobs in these files accordingly.
 

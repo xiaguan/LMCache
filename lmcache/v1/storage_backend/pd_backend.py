@@ -2,11 +2,9 @@
 
 # Standard
 from dataclasses import dataclass
-from tokenize import Number
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, List, Optional, Sequence, Union
 import math
 import threading
-import time
 
 # Third Party
 from mooncake.store import (
@@ -22,8 +20,6 @@ import zmq
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import (
-    STR_DTYPE_TO_TORCH_DTYPE,
-    TORCH_DTYPE_TO_STR_DTYPE,
     CacheEngineKey,
 )
 from lmcache.v1.config import LMCacheEngineConfig
