@@ -2,6 +2,7 @@
 
 # Standard
 from dataclasses import dataclass
+from tokenize import Number
 from typing import Any, Dict, List, Optional, Sequence, Union
 import math
 import threading
@@ -74,9 +75,6 @@ PDMsg = Union[AllocRequest, AllocResponse, ProxyNotif]
 @dataclass
 class PDConfig:
     role: str
-    peer_host: Optional[str]
-    peer_init_port: Optional[int]
-    peer_alloc_port: Optional[int]
     proxy_host: Optional[str]
     proxy_port: Optional[int]
     buffer_size: int
@@ -88,21 +86,8 @@ class PDConfig:
         metadata: LMCacheEngineMetadata,
         tp_rank: int,
     ) -> "PDConfig":
-        role = config.pd_role
-        # NOTE: pd_peer_* arrays are sharded by tp_rank when provided.
-        pd_peer_alloc_port = None
-        if config.pd_peer_alloc_port is not None:
-            pd_peer_alloc_port = config.pd_peer_alloc_port[tp_rank]
-
-        pd_peer_init_port = None
-        if config.pd_peer_init_port is not None:
-            pd_peer_init_port = config.pd_peer_init_port[tp_rank]
-
         return PDConfig(
-            role=role,
-            peer_host=config.pd_peer_host,
-            peer_init_port=pd_peer_init_port,
-            peer_alloc_port=pd_peer_alloc_port,
+            role=config.pd_role,
             proxy_host=config.pd_proxy_host,
             proxy_port=config.pd_proxy_port,
             buffer_size=config.pd_buffer_size,
@@ -137,10 +122,6 @@ class PDBackend(AllocatorBackendInterface):
         self.pd_config = PDConfig.from_cache_engine_config(
             config, metadata, self.tp_rank
         )
-        self.data: Dict[CacheEngineKey, MemoryObj] = {}
-        self.pending_chunks: Dict[CacheEngineKey, PendingChunk] = {}
-        self.remote_keys: Dict[CacheEngineKey, str] = {}
-        self.data_lock = threading.Lock()
 
         self.memory_allocator = self.initialize_allocator(config, metadata)
         assert isinstance(self.memory_allocator, PagedCpuGpuMemoryAllocator)
@@ -153,18 +134,12 @@ class PDBackend(AllocatorBackendInterface):
 
         self._setup_mooncake(metadata, config)
 
-        self.zmq_context = get_zmq_context(use_asyncio=False)
-        self.running_threads: list[threading.Thread] = []
-        self.side_channels: list[zmq.Socket] = []
+        self.zmq_context: Optional[zmq.Context] = None
+        self.proxy_side_channel = None
 
         if self.pd_config.role == "sender":
+            self.zmq_context = get_zmq_context(use_asyncio=False)
             self._init_sender()
-            self.initialized_peers: set[str] = set()
-            self.mem_alloc_sockets: Dict[str, zmq.Socket] = {}
-        elif self.pd_config.role == "receiver":
-            self._init_receiver()
-        else:
-            raise ValueError("Invalid PD role.")
 
         self.full_chunk_size = config.chunk_size
         self.meta_shape = torch.Size(metadata.kv_shape)
@@ -176,18 +151,6 @@ class PDBackend(AllocatorBackendInterface):
     def __str__(self):
         return self.__class__.__name__
 
-    def _to_local_key(self, remote_key: CacheEngineKey) -> CacheEngineKey:
-        if remote_key.worker_id == self.tp_rank:
-            return remote_key
-        return CacheEngineKey(
-            remote_key.fmt,
-            remote_key.model_name,
-            remote_key.world_size,
-            self.tp_rank,
-            remote_key.chunk_hash,
-            remote_key.request_configs,
-        )
-
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata
     ) -> PagedCpuGpuMemoryAllocator:
@@ -198,6 +161,7 @@ class PDBackend(AllocatorBackendInterface):
             config.pd_buffer_device,
             metadata.worker_id,
         )
+
         logger.info(f"Setting cuda device to {corrected_device}")
         torch.cuda.set_device(corrected_device)
 
@@ -217,33 +181,18 @@ class PDBackend(AllocatorBackendInterface):
         metadata: LMCacheEngineMetadata,
         config: LMCacheEngineConfig,
     ) -> None:
-        if self.mooncake_config.prefer_local_alloc:
-            try:
-                numa_mapping = NUMADetector.get_numa_mapping(config)
-                if numa_mapping:
-                    current_device_id = torch.cuda.current_device()
-                    gpu_to_numa = getattr(numa_mapping, "gpu_to_numa_mapping", {})
-                    numa_id = gpu_to_numa.get(current_device_id)
-                    if numa_id is not None:
-                        bind_to_numa_node(numa_id)
-                        logger.info(
-                            "Mooncake bind_to_numa_node success for GPU %s -> NUMA %s",
-                            current_device_id,
-                            numa_id,
-                        )
-            except Exception as exc:
-                logger.warning("Failed to bind Mooncake store to NUMA node: %s", exc)
-
-        if (
-            self.mooncake_config.storage_root_dir is not None
-            and self.mooncake_config.storage_root_dir != ""
-        ):
-            # Standard
-            import os
-
-            os.environ["MOONCAKE_STORAGE_ROOT_DIR"] = (
-                self.mooncake_config.storage_root_dir
-            )
+        numa_mapping = NUMADetector.get_numa_mapping(config)
+        if numa_mapping:
+            current_device_id = torch.cuda.current_device()
+            gpu_to_numa = getattr(numa_mapping, "gpu_to_numa_mapping", {})
+            numa_id = gpu_to_numa.get(current_device_id)
+            if numa_id is not None:
+                bind_to_numa_node(numa_id)
+                logger.info(
+                    "Mooncake bind_to_numa_node success for GPU %s -> NUMA %s",
+                    current_device_id,
+                    numa_id,
+                )
 
         setup_ret = self.mooncake_store.setup(
             self.mooncake_config.local_hostname,
@@ -309,24 +258,18 @@ class PDBackend(AllocatorBackendInterface):
         )
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
-        if self.pd_config.role == "sender":
-            return self.mooncake_store.is_exist(key.to_string())
-        elif self.pd_config.role == "receiver":
-            with self.data_lock:
-                mem_obj = self.data.get(key)
-                if mem_obj is None:
-                    return False
-                if pin:
-                    # Pin instead of increasing ref count.
-                    # Unpinned state continues to control eviction.
-                    mem_obj.pin()
-                return True
-        raise ValueError("Invalid PD role.")
+        return self.mooncake_store.is_exist(key.to_string())
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         return False
 
     def _init_sender(self):
+        if self.pd_config.proxy_host is None or self.pd_config.proxy_port is None:
+            raise ValueError(
+                "PD sender requires pd_proxy_host and pd_proxy_port to be configured"
+            )
+        if self.zmq_context is None:
+            raise RuntimeError("ZMQ context must be initialized for PD sender")
         proxy_url = f"{self.pd_config.proxy_host}:{self.pd_config.proxy_port}"
         self.proxy_side_channel = get_zmq_socket(
             self.zmq_context,
@@ -334,55 +277,6 @@ class PDBackend(AllocatorBackendInterface):
             "tcp",
             zmq.PUSH,
             "connect",
-        )
-
-    def _ensure_peer_connection(
-        self,
-        receiver_id: str,
-        receiver_host: str,
-        receiver_init_port: int,
-        receiver_alloc_port: int,
-    ) -> None:
-        if receiver_id in self.initialized_peers:
-            return
-
-        receiver_mem_alloc_url = f"{receiver_host}:{receiver_alloc_port}"
-        mem_alloc_socket = get_zmq_socket(
-            self.zmq_context,
-            receiver_mem_alloc_url,
-            "tcp",
-            zmq.REQ,
-            "connect",
-        )
-        self.mem_alloc_sockets[receiver_id] = mem_alloc_socket
-        self.initialized_peers.add(receiver_id)
-
-    def _remote_allocate(
-        self, receiver_id: str, alloc_request: AllocRequest
-    ) -> AllocResponse:
-        socket = self.mem_alloc_sockets[receiver_id]
-        socket.send(msgspec.msgpack.encode(alloc_request))
-        msg = socket.recv()
-        alloc_response = msgspec.msgpack.decode(msg, type=PDMsg)
-        assert isinstance(alloc_response, AllocResponse)
-        return alloc_response
-
-    def _get_remote_alloc_request(
-        self, keys: Sequence[CacheEngineKey], mem_objs: List[MemoryObj]
-    ) -> AllocRequest:
-        fmt = mem_objs[0].meta.fmt
-        shape = mem_objs[0].meta.shape
-        dtype = TORCH_DTYPE_TO_STR_DTYPE[mem_objs[0].meta.dtype]
-        token_dim = fmt.token_dim()
-        last_chunk_toks = mem_objs[-1].meta.shape[token_dim]
-        str_keys = [key.to_string() for key in keys]
-
-        return AllocRequest(
-            keys=str_keys,
-            fmt=fmt.value,
-            shape=list(shape),
-            dtype=dtype,
-            last_chunk_toks=last_chunk_toks,
         )
 
     def _batch_put_to_mooncake(
@@ -413,6 +307,22 @@ class PDBackend(AllocatorBackendInterface):
         for obj in memory_objs:
             obj.ref_count_down()
 
+    def _batched_submit_put_task_impl(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> None:
+        self._batch_put_to_mooncake(keys, memory_objs)
+        if (
+            transfer_spec
+            and getattr(transfer_spec, "is_last_prefill", False)
+            and self.proxy_side_channel is not None
+        ):
+            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
+            notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
+            self.proxy_side_channel.send(notif_msg_bytes)
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -422,58 +332,12 @@ class PDBackend(AllocatorBackendInterface):
         for mem_obj in memory_objs:
             mem_obj.ref_count_up()
 
-        receiver_init_port = transfer_spec.receiver_init_port[self.tp_rank]
-        receiver_alloc_port = transfer_spec.receiver_alloc_port[self.tp_rank]
-        receiver_host = transfer_spec.receiver_host
-        receiver_id = receiver_host + str(receiver_init_port)
-
-        self._ensure_peer_connection(
-            receiver_id=receiver_id,
-            receiver_host=receiver_host,
-            receiver_init_port=receiver_init_port,
-            receiver_alloc_port=receiver_alloc_port,
-        )
-
-        alloc_request = self._get_remote_alloc_request(keys, memory_objs)
-        alloc_response = self._remote_allocate(receiver_id, alloc_request)
-        already_sent_indexes = alloc_response.already_sent_indexes
-
-        upload_keys: list[CacheEngineKey] = []
-        upload_objs: list[MemoryObj] = []
-        for idx, (key, mem_obj) in enumerate(zip(keys, memory_objs, strict=False)):
-            if idx in already_sent_indexes:
-                mem_obj.ref_count_down()
-                continue
-            upload_keys.append(key)
-            upload_objs.append(mem_obj)
-
-        if upload_keys:
-            self._batch_put_to_mooncake(upload_keys, upload_objs)
-
-        if transfer_spec.is_last_prefill:
-            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-            notif_msg_bytes = msgspec.msgpack.encode(notif_msg)
-            self.proxy_side_channel.send(notif_msg_bytes)
-
-    ############################################################
-    # Receiver helpers
-    ############################################################
-    def _init_receiver(self):
-        assert self.pd_config.peer_host is not None
-        assert self.pd_config.peer_alloc_port is not None
-        receiver_alloc_url = (
-            f"{self.pd_config.peer_host}:{self.pd_config.peer_alloc_port}"
-        )
-        self.alloc_side_channel = get_zmq_socket(
-            self.zmq_context, receiver_alloc_url, "tcp", zmq.REP, "bind"
-        )
-        self.side_channels.append(self.alloc_side_channel)
-
-        self.mem_alloc_thread = threading.Thread(
-            target=self._mem_alloc_loop, daemon=True
-        )
-        self.mem_alloc_thread.start()
-        self.running_threads.append(self.mem_alloc_thread)
+        # create a thread to do this
+        threading.Thread(
+            target=self._batched_submit_put_task_impl,
+            args=(keys, memory_objs, transfer_spec),
+            daemon=True,
+        ).start()
 
     def _mooncake_exists(self, key_strs: Sequence[str]) -> list[bool]:
         if isinstance(key_strs, str):  # guard against accidental str iteration
@@ -486,123 +350,6 @@ class PDBackend(AllocatorBackendInterface):
 
         rets = self.mooncake_store.batch_is_exist(key_list)
         return [ret == 1 for ret in rets]
-
-    def _record_pending_chunk(
-        self,
-        key: CacheEngineKey,
-        alloc_request: AllocRequest,
-        idx: int,
-    ) -> PendingChunk:
-        fmt = MemoryFormat(alloc_request.fmt)
-        dtype = STR_DTYPE_TO_TORCH_DTYPE[alloc_request.dtype]
-        base_shape = list(alloc_request.shape)
-        token_dim = fmt.token_dim()
-        if idx == len(alloc_request.keys) - 1:
-            base_shape[token_dim] = alloc_request.last_chunk_toks
-        else:
-            base_shape[token_dim] = self.full_chunk_size
-        chunk_shape = torch.Size(base_shape)
-        pending = PendingChunk(chunk_shape, dtype, fmt)
-        self.pending_chunks[key] = pending
-        return pending
-
-    def _allocate_and_put(self, alloc_request: AllocRequest) -> AllocResponse:
-        already_sent: list[int] = []
-
-        remote_exists_flags = self._mooncake_exists(alloc_request.keys)
-        if len(remote_exists_flags) != len(alloc_request.keys):
-            raise RuntimeError(
-                "Mooncake batch_is_exist returned mismatched result length"
-            )
-
-        for idx, key_str in enumerate(alloc_request.keys):
-            exists_remote = remote_exists_flags[idx]
-            remote_key = CacheEngineKey.from_string(key_str)
-            local_key = self._to_local_key(remote_key)
-
-            with self.data_lock:
-                if local_key in self.data:
-                    already_sent.append(idx)
-                    continue
-                pending = self.pending_chunks.get(local_key)
-            if pending is None:
-                pending = self._record_pending_chunk(local_key, alloc_request, idx)
-                with self.data_lock:
-                    self.remote_keys[local_key] = key_str
-
-            if exists_remote:
-                already_sent.append(idx)
-
-            if pending.mem_obj is None:
-                mem_obj = self.allocate(
-                    torch.Size(pending.shape), pending.dtype, pending.fmt
-                )
-
-                wait_time = 0.01
-                while mem_obj is None:
-                    logger.warning(
-                        "Failed to allocate memory object, retrying...",
-                    )
-                    time.sleep(wait_time)
-                    mem_obj = self.allocate(
-                        torch.Size(pending.shape), pending.dtype, pending.fmt
-                    )
-
-                pending.mem_obj = mem_obj
-                pending.ready = False
-
-                with self.data_lock:
-                    self.data[local_key] = mem_obj
-
-        return AllocResponse(
-            already_sent_indexes=already_sent,
-            remote_indexes=[],
-        )
-
-    def _mem_alloc_loop(self):
-        while self.running:
-            try:
-                alloc_req_bytes = self.alloc_side_channel.recv()
-                alloc_req = msgspec.msgpack.decode(alloc_req_bytes, type=PDMsg)
-                assert isinstance(alloc_req, AllocRequest)
-                logger.info(
-                    "PDBackend receiver got alloc request for keys %s", alloc_req.keys
-                )
-                alloc_resp = self._allocate_and_put(alloc_req)
-                self.alloc_side_channel.send(msgspec.msgpack.encode(alloc_resp))
-            except Exception as exc:
-                logger.error("Failed to process mem alloc loop: %s", exc)
-                if self.running:
-                    time.sleep(0.01)
-
-    def _fetch_from_mooncake(
-        self, key_str: str, mem_obj: MemoryObj, pending: PendingChunk
-    ) -> None:
-        ptrs = [mem_obj.data_ptr]
-        sizes = [pending.num_bytes]
-
-        bytes_read = self.mooncake_store.batch_get_into([key_str], ptrs, sizes)
-
-        if len(bytes_read) != len(ptrs):
-            raise RuntimeError(
-                "Mooncake batch_get_into returned %s entries for %s keys"
-                % (len(bytes_read), len(ptrs))
-            )
-
-        for idx, num_bytes in enumerate(bytes_read):
-            expected = sizes[idx]
-            if num_bytes <= 0 or num_bytes != expected:
-                raise RuntimeError(
-                    (
-                        f"Mooncake get_into failed for key {key_str} at index {idx}, "
-                        f"expected {expected} but got {num_bytes}"
-                    )
-                )
-            logger.info(
-                "Mooncake batch_get_into fetched %s bytes for %s",
-                num_bytes,
-                key_str,
-            )
 
     def reshape_partial_chunk(
         self,
@@ -655,88 +402,7 @@ class PDBackend(AllocatorBackendInterface):
     ):
         raise NotImplementedError("PDBackend put is not implemented")
 
-    def _ensure_chunk_loaded(
-        self,
-        key: CacheEngineKey,
-        *,
-        add_ref: bool,
-    ) -> MemoryObj:
-        """Make sure the chunk backing ``key`` is allocated and hydrated."""
-        remote_key_str = self.remote_keys.get(key)
-        if remote_key_str is None:
-            remote_key_str = key.to_string()
-            logger.error(
-                "PDBackend fallback to local key string for %s during fetch",
-                remote_key_str,
-            )
-
-        with self.data_lock:
-            mem_obj = self.data.get(key)
-            pending = self.pending_chunks.get(key)
-
-        if pending is None and mem_obj is None:
-            raise KeyError(f"Key {key} not found in PD backend pending set")
-
-        if pending is not None:
-            if pending.mem_obj is None:
-                logger.info("PDBackend allocating GPU buffer for %s", key.to_string())
-                mem_obj = self.allocate(pending.shape, pending.dtype, pending.fmt)
-                wait_time = 0.01
-                while mem_obj is None:
-                    logger.warning(
-                        "Failed to allocate GPU memory for %s, retrying...", key
-                    )
-                    time.sleep(wait_time)
-                    mem_obj = self.allocate(pending.shape, pending.dtype, pending.fmt)
-                pending.mem_obj = mem_obj
-                pending.ready = False
-                with self.data_lock:
-                    self.data[key] = mem_obj
-            else:
-                mem_obj = pending.mem_obj
-
-            if not pending.ready:
-                logger.info(
-                    "PDBackend fetching chunk from Mooncake for %s",
-                    key.to_string(),
-                )
-                self._fetch_from_mooncake(remote_key_str, pending.mem_obj, pending)
-                pending.ready = True
-
-        if mem_obj is None:
-            with self.data_lock:
-                mem_obj = self.data.get(key)
-            if mem_obj is None:
-                raise KeyError(f"Key {key} not found in PD backend data store")
-
-        if add_ref:
-            mem_obj.ref_count_up()
-
-        return mem_obj
-
-    def get_blocking_for_sender(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        mem_obj = self.allocate(self.meta_shape, self.meta_dtype, self.meta_fmt)
-        if mem_obj is None:
-            logger.error(
-                "PDBackend sender failed to allocate buffer for key %s",
-                key.to_string(),
-            )
-            return None
-
-        bytes_read = self.mooncake_store.batch_get_into(
-            [key.to_string()], [mem_obj.data_ptr], [mem_obj.get_size()]
-        )
-        if not bytes_read:
-            logger.error(
-                "Mooncake batch_get_into returned no data for key %s",
-                key.to_string(),
-            )
-            return None
-
-        self.reshape_partial_chunk(mem_obj, bytes_read[0])
-        return mem_obj
-
-    def batched_get_blocking_for_sender(
+    def batched_get_blocking_impl(
         self, keys: list[CacheEngineKey]
     ) -> list[Optional[MemoryObj]]:
         mem_objs: list[Optional[MemoryObj]] = []
@@ -785,22 +451,10 @@ class PDBackend(AllocatorBackendInterface):
     def batched_get_blocking(
         self, keys: list[CacheEngineKey]
     ) -> list[Optional[MemoryObj]]:
-        if self.pd_config.role == "sender":
-            return self.batched_get_blocking_for_sender(keys)
-        elif self.pd_config.role == "receiver":
-            mem_objs: list[Optional[MemoryObj]] = []
-            for key in keys:
-                mem_obj = self._ensure_chunk_loaded(key, add_ref=True)
-                mem_objs.append(mem_obj)
-            return mem_objs
-        raise ValueError("Invalid PD role.")
+        return self.batched_get_blocking_impl(keys)
 
     def get_blocking(self, key: CacheEngineKey) -> Optional[MemoryObj]:
-        if self.pd_config.role == "sender":
-            return self.get_blocking_for_sender(key)
-        elif self.pd_config.role == "receiver":
-            return self._ensure_chunk_loaded(key, add_ref=True)
-        raise ValueError("Invalid PD role.")
+        raise NotImplementedError("PDBackend get_blocking is not implemented")
 
     async def batched_get_non_blocking(
         self,
@@ -817,65 +471,17 @@ class PDBackend(AllocatorBackendInterface):
         key: CacheEngineKey,
         force: bool = True,
     ) -> bool:
-        removed = False
-        with self.data_lock:
-            popped_mem_obj = None
-            if key in self.data:
-                popped_mem_obj = self.data.pop(key)
-                popped_mem_obj.ref_count_down()
-                removed = True
-                self.remote_keys.pop(key, None)
-            if key in self.pending_chunks:
-                pending = self.pending_chunks.pop(key)
-                if (
-                    pending.mem_obj is not None
-                    and pending.mem_obj is not popped_mem_obj
-                ):
-                    pending.mem_obj.ref_count_down()
-                removed = True
-        return removed
+        return True
 
     def close(self) -> None:
         self.running = False
-        for thread in self.running_threads:
-            thread.join()
-
-        if self.registered_gpu_ptr is not None:
-            result = self.mooncake_store.unregister_buffer(self.registered_gpu_ptr)
-            if result != 0:
-                logger.warning(
-                    "Mooncake GPU buffer unregister failed: ptr=%s err=%s",
-                    hex(self.registered_gpu_ptr),
-                    result,
-                )
-
-        try:
-            self.mooncake_store.close()
-        except Exception as exc:
-            logger.warning("Failed to close Mooncake store cleanly: %s", exc)
-
-        self.zmq_context.term()
+        if self.zmq_context is not None:
+            self.zmq_context.term()
+            self.zmq_context = None
+        self.proxy_side_channel = None
 
     def pin(self, key: CacheEngineKey) -> bool:
-        with self.data_lock:
-            mem_obj = self.data.get(key)
-            if mem_obj is None:
-                pending = self.pending_chunks.get(key)
-                if pending is not None and pending.mem_obj is not None:
-                    mem_obj = pending.mem_obj
-            if mem_obj is None:
-                return False
-            mem_obj.pin()
-            return True
+        return True
 
     def unpin(self, key: CacheEngineKey) -> bool:
-        with self.data_lock:
-            mem_obj = self.data.get(key)
-            if mem_obj is None:
-                pending = self.pending_chunks.get(key)
-                if pending is not None and pending.mem_obj is not None:
-                    mem_obj = pending.mem_obj
-            if mem_obj is None:
-                return False
-            mem_obj.unpin()
-            return True
+        return True

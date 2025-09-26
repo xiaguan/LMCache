@@ -88,6 +88,8 @@ P99 ITL (ms):                            11.43
   `extra_config`.
 - `configs/lmcache-decoder-config.yaml` - Configuration for decoder server. The decoder lazily
   pulls KV chunks from Mooncake when the proxy notifies that uploads are complete.
+  The Mooncake PD path no longer requires any `pd_peer_*` ZMQ endpoints; only the prefiller's
+  `pd_proxy_host`/`pd_proxy_port` pair is used to push completion notifications.
   If you need to revert to the GPU→GPU direct transfer channel, change `transfer_channel` and
   related PD knobs in these files accordingly.
 

@@ -314,8 +314,6 @@ async def handle_completions(request: Request):
             "receiver_init_port": decode_client.init_port,
             "receiver_alloc_port": decode_client.alloc_port,
         }
-        logger.info("[Chat] req=%s disagg_spec=%s", req_id, disagg_spec)
-        logger.info("[Completions] req=%s disagg_spec=%s", req_id, disagg_spec)
         num_tp_rank = len(decode_client.init_port)
 
         req_data["kv_transfer_params"] = {
@@ -328,22 +326,12 @@ async def handle_completions(request: Request):
 
         # Send request to prefill service round robin, ignore the response
         prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
-        logger.info(
-            "[Completions] req=%s sending prefill to %s",
-            req_id,
-            prefill_client.client.base_url,
-        )
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
 
         prefill_output = prefill_output.json()
         prefill_kv_params = prefill_output.get("kv_transfer_params", {})
-        logger.info(
-            "[Completions] req=%s received prefill kv params=%s",
-            req_id,
-            prefill_kv_params,
-        )
 
         et = time.time()
         stats_calculator.add(et - st)
@@ -352,18 +340,12 @@ async def handle_completions(request: Request):
         prefill_kv_params = prefill_output.get("kv_transfer_params", {})
         first_tok = prefill_kv_params.get("first_tok")
         if first_tok is not None:
-            logger.info("[Completions] req=%s forwarding first token", req_id)
             req_data["prompt"].append(first_tok)
         decoder_kv_params = {
             k: v for k, v in prefill_kv_params.items() if k != "first_tok"
         }
         decoder_kv_params["disagg_spec"] = disagg_spec
         req_data["kv_transfer_params"] = decoder_kv_params
-        logger.info(
-            "[Completions] req=%s forwarded kv_transfer_params=%s",
-            req_id,
-            decoder_kv_params,
-        )
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -461,21 +443,11 @@ async def handle_chat_completions(request: Request):
 
         # Send request to prefill service round robin, get the response
         prefill_client = round_robin_pick_client(app.state.prefill_clients, counter)
-        logger.info(
-            "[Chat] req=%s sending prefill to %s",
-            req_id,
-            prefill_client.client.base_url,
-        )
         prefill_output = await send_request_to_service(
             prefill_client.client, "/v1/completions", req_data
         )
 
         prefill_output = prefill_output.json()
-        logger.info(
-            "[Chat] req=%s received prefill kv params=%s",
-            req_id,
-            prefill_output.get("kv_transfer_params", {}),
-        )
 
         et = time.time()
         stats_calculator.add(et - st)
@@ -488,7 +460,6 @@ async def handle_chat_completions(request: Request):
         prefill_kv_params = prefill_output.get("kv_transfer_params", {})
         first_tok = prefill_kv_params.get("first_tok")
         if first_tok is not None:
-            logger.info("[Chat] req=%s forwarding first token", req_id)
             req_data["prompt"].append(first_tok)
 
         decoder_kv_params = {
@@ -497,11 +468,6 @@ async def handle_chat_completions(request: Request):
         decoder_kv_params["disagg_spec"] = disagg_spec
 
         req_data["kv_transfer_params"] = decoder_kv_params
-        logger.info(
-            "[Chat] req=%s forwarded kv_transfer_params=%s",
-            req_id,
-            decoder_kv_params,
-        )
         req_data["stream"] = True
         if stream_options is not None:
             req_data["stream_options"] = stream_options
@@ -558,6 +524,21 @@ async def handle_chat_completions(request: Request):
                         json_str = chunk_str[6:].strip()  # Remove 'data: ' prefix
                         if json_str:
                             completion_data = json.loads(json_str)
+                            choices = completion_data.get("choices") or []
+                            if not choices:
+                                # Surface chunks we can't interpret instead of
+                                # crashing the stream on empty choice payloads.
+                                yield chunk
+                                continue
+
+                            choice = choices[0]
+                            text = choice.get("text")
+                            if text is None:
+                                text = choice.get("delta", {}).get("content")
+                                if text is None:
+                                    yield chunk
+                                    continue
+
                             chat_completion_data = {
                                 "id": completion_data["id"],
                                 "object": "chat.completion.chunk",
@@ -566,17 +547,9 @@ async def handle_chat_completions(request: Request):
                                 "choices": [
                                     {
                                         "index": 0,
-                                        "delta": {
-                                            "content": completion_data["choices"][0][
-                                                "text"
-                                            ]
-                                        },
-                                        "logprobs": completion_data["choices"][0].get(
-                                            "logprobs"
-                                        ),
-                                        "finish_reason": completion_data["choices"][
-                                            0
-                                        ].get("finish_reason"),
+                                        "delta": {"content": text},
+                                        "logprobs": choice.get("logprobs"),
+                                        "finish_reason": choice.get("finish_reason"),
                                     }
                                 ],
                             }

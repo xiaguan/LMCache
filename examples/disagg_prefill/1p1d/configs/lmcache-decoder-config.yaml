@@ -3,9 +3,6 @@ local_cpu: False
 enable_pd: True
 transfer_channel: "nixl"  # placeholder; PD backend uses Mooncake instead of NIXL
 pd_role: "receiver"
-pd_peer_host: "localhost"
-pd_peer_init_port: 7300
-pd_peer_alloc_port: 7400
 pd_buffer_size: 1468006400 # 1.37 GiB staging buffer aligned to 14,680,064
 pd_buffer_device: "cuda"
 pre_caching_hash_algorithm: sha256_cbor_64bit
